@@ -22,6 +22,7 @@ def get_ranks_info():
     rank = None
     max_rank = None
     try:
+        print "Import MPI"
         from mpi4py import MPI
         comm = MPI.COMM_WORLD
         rank = comm.Get_rank()

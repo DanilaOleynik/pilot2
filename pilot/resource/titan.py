@@ -14,7 +14,8 @@ import shutil
 import sys
 import time
 
-from jobdescription import JobDescription
+#from jobdescription import JobDescription
+from pilot.info.jobdata import JobData
 from pilot.common.exception import FileHandlingFailure
 from pilot.util.config import config
 from pilot.util.constants import PILOT_PRE_STAGEIN, PILOT_POST_STAGEIN
@@ -51,8 +52,7 @@ def get_job(harvesterpath):
     job_def_filename = os.path.join(job_workdir, config.Harvester.pandajob_file)
     jobs_dict = read_json(job_def_filename)
     job_dict = jobs_dict[str(pandaid)]
-    job = JobDescription()
-    job.load(job_dict)
+    job = JobData(job_dict)
 
     return job, rank
 
@@ -98,6 +98,7 @@ def set_job_workdir(job, path):
     """
     work_dir = os.path.join(path, str(job.jobid))
     os.chdir(work_dir)
+    cleanup_pathes()
 
     return work_dir
 
@@ -116,8 +117,8 @@ def set_scratch_workdir(job, work_dir, args):
     du = disk_usage(scratch_path)
     logger.info("Scratch dir available space: {0} used: {1}".format(du.free, du.used))
     job_scratch_dir = os.path.join(scratch_path, str(job.jobid))
-    for inp_file in job.input_files:
-        job.input_files[inp_file]["scratch_path"] = job_scratch_dir
+    for inp_file in job.indata:
+        inp_file.scratch_path = job_scratch_dir
     logger.debug("Job scratch path: {0}".format(job_scratch_dir))
     # special data, that should be preplaced in RAM disk
     dst_db_path = 'sqlite200/'
@@ -154,11 +155,9 @@ def set_scratch_workdir(job, work_dir, args):
             if not os.path.exists(job_scratch_dir):
                 os.makedirs(job_scratch_dir)
             logger.debug("Copy input file")
-            for inp_file in job.input_files:
-                logger.debug("Copy: {0} to {1}".format(os.path.join(work_dir, inp_file),
-                                                       job.input_files[inp_file]["scratch_path"]))
-                shutil.copyfile(os.path.join(work_dir, inp_file),
-                                os.path.join(job.input_files[inp_file]["scratch_path"], inp_file))
+            for inp_file in job.indata:
+                logger.debug("Copy: {0} to {1}".format(os.path.join(work_dir, inp_file.lfn), inp_file.scratch_path))
+                shutil.copyfile(os.path.join(work_dir, inp_file.lfn), os.path.join(inp_file.scratch_path, inp_file.lfn))
             input_cp_time = time.time() - t0
             logger.debug("Copy of input files took: {0}".format(input_cp_time))
         except IOError as e:
@@ -223,9 +222,9 @@ def postprocess_workdir(workdir):
         raise FileHandlingFailure("Post processing of working directory failed")
 
 
-def command_fix(command, job_scratch_dir):
+def command_fix(command, job_scratch_dir=""):
     """
-    Modifing of payload parameters, to be executed on Titan on RAM disk. Clenup of some
+    Modifing of payload parameters, to be executed on Titan on RAM disk. Cleanup of some
 
     :param command:
     :param job_scratch_dir:
@@ -244,5 +243,34 @@ def command_fix(command, job_scratch_dir):
     fixed_command = ' '.join(subs_a)
     fixed_command = fixed_command.strip()
     fixed_command = fixed_command.replace('--DBRelease="all:current"', '')  # avoid Frontier reading
+    fixed_command = fixed_command.replace('--DBRelease=all:current', '')
 
     return fixed_command
+
+
+def cleanup_pathes(pathprefix="/lustre/"):
+    """"
+    Cleanup of PATH, LD_PATH etc from entities, which points to shared file system required to reduce IO from traversing
+    of python libraries
+    """
+    path = os.environ['PATH'].split(':')
+    for p in path[:]:
+        if p.startswith("/lustre/"):
+            path.remove(p)
+    ppath = os.environ['PYTHONPATH'].split(':')
+    for p in ppath[:]:
+        if p.startswith("/lustre/"):
+            ppath.remove(p)
+    ldpath = os.environ['LD_LIBRARY_PATH'].split(':')
+    for p in ldpath[:]:
+        if p.startswith("/lustre/"):
+            ldpath.remove(p)
+
+    os.environ['PATH'] = ':'.join(path)
+    os.putenv('PATH', ':'.join(path))
+    os.environ['PYTHONPATH'] = ':'.join(ppath)
+    os.putenv('PYTHONPATH', ':'.join(ppath))
+    os.environ['LD_LIBRARY_PATH'] = ':'.join(ldpath)
+    os.putenv('LD_LIBRARY_PATH', ':'.join(ldpath))
+
+    return 0

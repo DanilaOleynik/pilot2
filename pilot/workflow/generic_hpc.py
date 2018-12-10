@@ -98,7 +98,7 @@ def run(args):
         # Prepare job scratch directory (RAM disk etc.)
         job_scratch_dir = resource.set_scratch_workdir(job, work_dir, args)
 
-        my_command = " ".join([job.script, job.script_parameters])
+        my_command = " ".join([job.transformation, job.jobparams])
         my_command = resource.command_fix(my_command, job_scratch_dir)
         my_command = setup_str + my_command
         add_to_pilot_timing(job.jobid, PILOT_POST_SETUP, time.time(), args)
@@ -135,13 +135,13 @@ def run(args):
             job.state = 'finished'
         else:
             job.state = 'failed'
-        job.exitcode = exit_code
+        job.transexitcode = exit_code
 
         work_report["startTime"] = job.startTime
         work_report["endTime"] = job.endTime
         work_report["jobStatus"] = job.state
         work_report["cpuConsumptionTime"] = t_tot
-        work_report["transExitCode"] = job.exitcode
+        work_report["transExitCode"] = job.transexitcode
 
         log_jobreport = "\nPayload exit code: {0} JobID: {1} \n".format(exit_code, job.jobid)
         log_jobreport += "CPU comsumption time: {0}  JobID: {1} \n".format(t_tot, job.jobid)
@@ -161,13 +161,14 @@ def run(args):
         resource.postprocess_workdir(job_scratch_dir)
 
         # output files should not be packed with logs
-        protectedfiles = job.output_files.keys()
+        protectedfiles = []
+        for f in job.outdata:
+            protectedfiles.append(f.lfn)
 
         # log file not produced (yet), so should be excluded
-        if job.log_file in protectedfiles:
-            protectedfiles.remove(job.log_file)
-        else:
-            logger.info("Log files was not declared")
+        for f in job.logdata:
+            if f.lfn in protectedfiles:
+                protectedfiles.remove(f.lfn)
 
         logger.info("Cleanup of working directory")
 
