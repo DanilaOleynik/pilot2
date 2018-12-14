@@ -19,22 +19,18 @@ import time
 from os import getcwd, chdir, environ
 from shutil import rmtree
 
+from pilot.common.exception import QueuedataFailure, PilotException
 from pilot.info import set_info
 from pilot.util.auxiliary import shell_exit_code
 from pilot.util.config import config
-from pilot.util.constants import SUCCESS, FAILURE, ERRNO_NOJOBS, PILOT_START_TIME, PILOT_END_TIME
+from pilot.util.constants import SUCCESS, FAILURE, ERRNO_NOJOBS, PILOT_START_TIME, PILOT_END_TIME, get_pilot_version
 from pilot.util.filehandling import get_pilot_work_dir, create_pilot_work_dir
 from pilot.util.harvester import is_harvester_mode
 from pilot.util.https import https_setup
 from pilot.util.information import set_location
+from pilot.util.mpi import get_ranks_info
 from pilot.util.timing import add_to_pilot_timing
 from pilot.util.workernode import is_virtual_machine
-from pilot.util.mpi import get_ranks_info
-
-RELEASE = '2'  # fixed at 2 for Pilot 2
-VERSION = '0'  # '1' for first real Pilot 2 release, '0' until then, increased for bigger updates
-REVISION = '0'  # reset to '0' for every new Pilot version release, increased for small updates
-BUILD = '81'  # reset to '1' for every new development cycle
 
 
 def pilot_version_banner():
@@ -46,7 +42,7 @@ def pilot_version_banner():
 
     logger = logging.getLogger(__name__)
 
-    version = '***  PanDA Pilot 2 version %s  ***' % get_pilot_version()
+    version = '***  PanDA Pilot version %s  ***' % get_pilot_version()
     logger.info('*' * len(version))
     logger.info(version)
     logger.info('*' * len(version))
@@ -54,19 +50,6 @@ def pilot_version_banner():
 
     if is_virtual_machine():
         logger.info('pilot is running in a VM')
-
-
-def get_pilot_version():
-    """
-    Return the current Pilot version string with the format <release>.<version>.<revision> (<build>).
-    E.g. pilot_version = '2.1.3 (12)'
-    :return: version string.
-    """
-
-    return '{release}.{version}.{revision} ({build})'.format(release=RELEASE,
-                                                             version=VERSION,
-                                                             revision=REVISION,
-                                                             build=BUILD)
 
 
 def main():
@@ -101,9 +84,19 @@ def main():
     if not args.workflow == "generic_hpc":  # set_location does not work well for hpc workflow
         if not set_location(args):  # ## DEPRECATE ME LATER
             return False
+        else:
+            # set the site name for rucio
+            environ['PILOT_RUCIO_SITENAME'] = args.location.site
 
     # initialize InfoService and populate args.info structure
-    set_info(args)
+    try:
+        set_info(args)
+    except QueuedataFailure as error:
+        logger.fatal(error)
+        return error.get_error_code()
+    except PilotException as error:
+        logger.fatal(error)
+        return error.get_error_code()
 
     # set requested workflow
     logger.info('pilot arguments: %s' % str(args))
@@ -215,7 +208,7 @@ def get_args():
                             choices=['generic', 'generic_hpc',
                                      'production', 'production_hpc',
                                      'analysis', 'analysis_hpc',
-                                     'eventservice', 'eventservice_hpc'],
+                                     'eventservice_hpc'],
                             help='Pilot workflow (default: generic)')
 
     # graciously stop pilot process after hard limit
@@ -422,6 +415,9 @@ def set_environment_variables(args, mainworkdir):
     # set the pilot user (e.g. ATLAS)
     environ['PILOT_USER'] = args.pilot_user  # TODO: replace with singleton
 
+    # internal pilot state
+    environ['PILOT_STATE'] = 'startup'  # TODO: replace with singleton
+
     # set the pilot version
     environ['PILOT_VERSION'] = get_pilot_version()
 
@@ -481,30 +477,30 @@ def wrap_up(initdir, mainworkdir, args):
         from pilot.util.harvester import kill_worker
         kill_worker()
 
-    if not trace:
-        logging.critical('pilot startup did not succeed -- aborting')
-        exit_code = FAILURE
-    elif trace.pilot['nr_jobs'] > 0:
-        if trace.pilot['nr_jobs'] == 1:
-            logging.getLogger(__name__).info('pilot has finished (%d job was processed)' % trace.pilot['nr_jobs'])
-        else:
-            logging.getLogger(__name__).info('pilot has finished (%d jobs were processed)' % trace.pilot['nr_jobs'])
-        exit_code = SUCCESS
-    elif trace.pilot['state'] == FAILURE:
-        logging.critical('pilot workflow failure -- aborting')
-        exit_code = FAILURE
-    elif trace.pilot['state'] == ERRNO_NOJOBS:
-        logging.critical('pilot did not process any events -- aborting')
-        exit_code = ERRNO_NOJOBS
+    try:
+        exit_code = trace.pilot['error_code']
+    except Exception:
+        exit_code = trace
     else:
-        logging.info('pilot has finished')
-        exit_code = SUCCESS
-
+        logging.info('traces error code: %d' % exit_code)
+        if trace.pilot['nr_jobs'] <= 1:
+            if exit_code != 0:
+                logging.info('an exit code was already set: %d (will be converted to a standard shell code)' % exit_code)
+        elif trace.pilot['nr_jobs'] > 0:
+            if trace.pilot['nr_jobs'] == 1:
+                logging.getLogger(__name__).info('pilot has finished (%d job was processed)' % trace.pilot['nr_jobs'])
+            else:
+                logging.getLogger(__name__).info('pilot has finished (%d jobs were processed)' % trace.pilot['nr_jobs'])
+            exit_code = SUCCESS
+        elif trace.pilot['state'] == FAILURE:
+            logging.critical('pilot workflow failure -- aborting')
+        elif trace.pilot['state'] == ERRNO_NOJOBS:
+            logging.critical('pilot did not process any events -- aborting')
+            exit_code = ERRNO_NOJOBS
+    logging.info('pilot has finished')
     logging.shutdown()
 
-    # exit_code = shell_exit_code(exit_code)
-
-    return exit_code
+    return shell_exit_code(exit_code)
 
 
 if __name__ == '__main__':
@@ -530,9 +526,9 @@ if __name__ == '__main__':
     # if requested by the wrapper via a pilot option, create the main pilot workdir and cd into it
     args.sourcedir = getcwd()
 
-    ec, mainworkdir = create_main_work_dir(args)
-    if ec != 0:
-        sys.exit(ec)
+    exit_code, mainworkdir = create_main_work_dir(args)
+    if exit_code != 0:
+        sys.exit(exit_code)
 
     # set environment variables (to be replaced with singleton implementation)
     set_environment_variables(args, mainworkdir)
@@ -547,7 +543,7 @@ if __name__ == '__main__':
     add_to_pilot_timing('0', PILOT_END_TIME, time.time(), args, store=False)
 
     # perform cleanup and terminate logging
-    ec = wrap_up(args.sourcedir, mainworkdir, args)
+    exit_code = wrap_up(args.sourcedir, mainworkdir, args)
 
     # the end.
-    sys.exit(ec)
+    sys.exit(exit_code)

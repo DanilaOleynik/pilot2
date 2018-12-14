@@ -7,12 +7,15 @@
 # Authors:
 # - Paul Nilsson, paul.nilsson@cern.ch, 2017-2018
 
+import collections
 import hashlib
 import io
 import os
+import re
 import tarfile
 import time
 import uuid
+from json import load, dump
 from shutil import copy2
 from zlib import adler32
 
@@ -153,6 +156,43 @@ def tail(filename, nlines=10):
     return stdout
 
 
+def grep(patterns, file_name):
+    """
+    Search for the patterns in the given list in a file.
+
+    Example:
+      grep(["St9bad_alloc", "FATAL"], "athena_stdout.txt")
+      -> [list containing the lines below]
+        CaloTrkMuIdAlg2.sysExecute()             ERROR St9bad_alloc
+        AthAlgSeq.sysExecute()                   FATAL  Standard std::exception is caught
+
+    :param patterns: list of regexp patterns.
+    :param file_name: file name (string).
+    :return: list of matched lines in file.
+    """
+
+    matched_lines = []
+    p = []
+    for pattern in patterns:
+        p.append(re.compile(pattern))
+
+    f = open_file(file_name, 'r')
+    if f:
+        while True:
+            # get the next line in the file
+            line = f.readline()
+            if not line:
+                break
+
+            # can the search pattern be found
+            for cp in p:
+                if re.search(cp, line):
+                    matched_lines.append(line)
+        f.close()
+
+    return matched_lines
+
+
 def convert(data):
     """
     Convert unicode data to utf-8.
@@ -177,7 +217,6 @@ def convert(data):
     :return: converted data to utf-8
     """
 
-    import collections
     if isinstance(data, basestring):
         return str(data)
     elif isinstance(data, collections.Mapping):
@@ -186,6 +225,22 @@ def convert(data):
         return type(data)(map(convert, data))
     else:
         return data
+
+
+def is_json(input_file):
+    """
+    Check if the file is in JSON format.
+    The function reads the first character of the file, and if it is "{" then returns True.
+
+    :param input_file: file name (string)
+    :return: Boolean.
+    """
+
+    with open(input_file) as unknown_file:
+        c = unknown_file.read(1)
+        if c == '{':
+            return True
+        return False
 
 
 def read_json(filename):
@@ -200,7 +255,6 @@ def read_json(filename):
     dictionary = None
     f = open_file(filename, 'r')
     if f:
-        from json import load
         try:
             dictionary = load(f)
         except PilotException as e:
@@ -230,7 +284,6 @@ def write_json(filename, dictionary):
 
     status = False
 
-    from json import dump
     try:
         fp = open(filename, "w")
     except IOError as e:
@@ -251,13 +304,17 @@ def write_json(filename, dictionary):
 def touch(path):
     """
     Touch a file and update mtime in case the file exists.
+    Default to use execute() if case of python problem with appending to non-existant path.
 
-    :param path:
+    :param path: full path to file to be touched (string).
     :return:
     """
 
-    with open(path, 'a'):
-        os.utime(path, None)
+    try:
+        with open(path, 'a'):
+            os.utime(path, None)
+    except Exception:
+        exit_code, stdout, stderr = execute('touch %s' % path)
 
 
 def remove_empty_directories(src_dir):

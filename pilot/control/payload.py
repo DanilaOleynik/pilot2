@@ -11,7 +11,6 @@
 # - Paul Nilsson, paul.nilsson@cern.ch, 2017-2018
 # - Wen Guan, wen.guan@cern.ch, 2017-2018
 
-import json
 import os
 import time
 import traceback
@@ -23,10 +22,11 @@ except Exception:
 
 from pilot.control.payloads import generic, eventservice, eventservicemerge
 from pilot.control.job import send_state
-from pilot.util.auxiliary import get_logger
+from pilot.util.auxiliary import get_logger, set_pilot_state
 from pilot.util.processes import get_cpu_consumption_time
 from pilot.util.config import config
-from pilot.util.filehandling import read_file, get_guid
+from pilot.util.filehandling import read_file
+from pilot.util.queuehandling import put_in_queue
 from pilot.common.errorcodes import ErrorCodes
 from pilot.common.exception import ExcThread
 
@@ -99,9 +99,11 @@ def validate_pre(queues, traces, args):
             continue
 
         if _validate_payload(job):
-            queues.validated_payloads.put(job)
+            #queues.validated_payloads.put(job)
+            put_in_queue(job, queues.validated_payloads)
         else:
-            queues.failed_payloads.put(job)
+            #queues.failed_payloads.put(job)
+            put_in_queue(job, queues.failed_payloads)
 
 
 def _validate_payload(job):
@@ -120,21 +122,23 @@ def _validate_payload(job):
     return True
 
 
-def get_payload_executor(args, job, out, err):
+def get_payload_executor(args, job, out, err, traces):
     """
     Get payload executor function for different payload.
-     :param args:
-    :param job:
+
+    :param args: args object.
+    :param job: job object.
     :param out:
     :param err:
+    :param traces: traces object.
     :return: instance of a payload executor
     """
     if job.is_eventservice:
-        payload_executor = eventservice.Executor(args, job, out, err)
+        payload_executor = eventservice.Executor(args, job, out, err, traces)
     elif job.is_eventservicemerge:
-        payload_executor = eventservicemerge.Executor(args, job, out, err)
+        payload_executor = eventservicemerge.Executor(args, job, out, err, traces)
     else:
-        payload_executor = generic.Executor(args, job, out, err)
+        payload_executor = generic.Executor(args, job, out, err, traces)
     return payload_executor
 
 
@@ -157,7 +161,8 @@ def execute_payloads(queues, traces, args):
             q_snapshot = list(queues.finished_data_in.queue)
             peek = [s_job for s_job in q_snapshot if job.jobid == s_job.jobid]
             if len(peek) == 0:
-                queues.validated_payloads.put(job)
+                #queues.validated_payloads.put(job)
+                put_in_queue(job, queues.validated_payloads)
                 for i in xrange(10):
                     if args.graceful_stop.is_set():
                         break
@@ -165,7 +170,8 @@ def execute_payloads(queues, traces, args):
                 continue
 
             # this job is now to be monitored, so add it to the monitored_payloads queue
-            queues.monitored_payloads.put(job)
+            #queues.monitored_payloads.put(job)
+            put_in_queue(job, queues.monitored_payloads)
 
             log.info('job %s added to monitored payloads queue' % job.jobid)
 
@@ -174,37 +180,38 @@ def execute_payloads(queues, traces, args):
 
             send_state(job, args, 'starting')
 
-            payload_executor = get_payload_executor(args, job, out, err)
+            payload_executor = get_payload_executor(args, job, out, err, traces)
             log.info("Got payload executor: %s" % payload_executor)
 
             # run the payload and measure the execution time
             job.t0 = os.times()
             exit_code = payload_executor.run()
 
-            cpuconsumptiontime = get_cpu_consumption_time(job.t0)
-            job.cpuconsumptiontime = int(round(cpuconsumptiontime))
-            job.cpuconsumptionunit = "s"
-            job.cpuconversionfactor = 1.0
-            log.info('CPU consumption time: %f %s (rounded to %d %s)' %
-                     (cpuconsumptiontime, job.cpuconsumptionunit, job.cpuconsumptiontime, job.cpuconsumptionunit))
+            set_cpu_consumption_time(job)
+            job.transexitcode = exit_code % 255
 
             out.close()
             err.close()
 
-            if exit_code == 0:
-                job.transexitcode = 0
-                queues.finished_payloads.put(job)
+            # analyze and interpret the payload execution output
+            perform_initial_payload_error_analysis(job, exit_code)
+            pilot_user = os.environ.get('PILOT_USER', 'generic').lower()
+            user = __import__('pilot.user.%s.diagnose' % pilot_user, globals(), locals(), [pilot_user], -1)
+            try:
+                exit_code_interpret = user.interpret(job)
+            except Exception as e:
+                log.warning('exception caught: %s' % e)
+                exit_code_interpret = -1
+                job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(errors.INTERNALPILOTPROBLEM)
+
+            if exit_code_interpret == 0 and exit_code == 0:
+                log.info('main payload error analysis completed - did not find any errors')
+                # queues.finished_payloads.put(job)
+                put_in_queue(job, queues.finished_payloads)
             else:
-                stderr = read_file(os.path.join(job.workdir, config.Payload.payloadstderr))
-                if stderr != "":
-                    msg = errors.extract_stderr_msg(stderr)
-                    if msg != "":
-                        log.warning("extracted message from stderr:\n%s" % msg)
-                ec = errors.resolve_transform_error(exit_code, stderr)
-                if ec != 0:
-                    job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(ec)
-                job.transexitcode = exit_code
-                queues.failed_payloads.put(job)
+                log.debug('main payload error analysis completed - adding job to failed_payloads queue')
+                #queues.failed_payloads.put(job)
+                put_in_queue(job, queues.failed_payloads)
 
         except queue.Empty:
             continue
@@ -212,60 +219,56 @@ def execute_payloads(queues, traces, args):
             logger.fatal('execute payloads caught an exception (cannot recover): %s, %s' % (e, traceback.format_exc()))
             if job:
                 job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(errors.PAYLOADEXECUTIONEXCEPTION)
-                queues.failed_payloads.put(job)
+                #queues.failed_payloads.put(job)
+                put_in_queue(job, queues.failed_payloads)
             while not args.graceful_stop.is_set():
                 # let stage-out of log finish, but stop running payloads as there should be a problem with the pilot
                 time.sleep(5)
 
 
-def process_job_report(job):
+def set_cpu_consumption_time(job):
     """
-    Process the job report produced by the payload/transform if it exists.
-    Payload error codes and diagnostics, as well as payload metadata (for output files) and stageout type will be
-    extracted. The stageout type is either "all" (i.e. stage-out both output and log files) or "log" (i.e. only log file
-    will be staged out).
-    Note: some fields might be experiment specific. A call to a user function is therefore also done.
-
-    :param job: job dictionary will be updated by the function and several fields set.
+    Set the CPU consumption time.
+    :param job: job object.
     :return:
     """
 
     log = get_logger(job.jobid, logger)
-    path = os.path.join(job.workdir, config.Payload.jobreport)
-    if not os.path.exists(path):
-        log.warning('job report does not exist: %s (any missing output file guids must be generated)' % path)
 
-        # add missing guids
-        for dat in job.outdata:
-            if not dat.guid:
-                dat.guid = get_guid()
-                log.warning('guid not set: generated guid=%s for lfn=%s' % (dat.guid, dat.lfn))
+    cpuconsumptiontime = get_cpu_consumption_time(job.t0)
+    job.cpuconsumptiontime = int(round(cpuconsumptiontime))
+    job.cpuconsumptionunit = "s"
+    job.cpuconversionfactor = 1.0
+    log.info('CPU consumption time: %f %s (rounded to %d %s)' %
+             (cpuconsumptiontime, job.cpuconsumptionunit, job.cpuconsumptiontime, job.cpuconsumptionunit))
 
+
+def perform_initial_payload_error_analysis(job, exit_code):
+    """
+    Perform an initial analysis of the payload.
+    Singularity errors are caught here.
+
+    :param job: job object.
+    :param exit_code: exit code from payload execution.
+    :return:
+    """
+
+    log = get_logger(job.jobid, logger)
+
+    if exit_code != 0:
+        log.warning('main payload execution returned non-zero exit code: %d' % exit_code)
+        stderr = read_file(os.path.join(job.workdir, config.Payload.payloadstderr))
+        if stderr != "":
+            msg = errors.extract_stderr_msg(stderr)
+            if msg != "":
+                log.warning("extracted message from stderr:\n%s" % msg)
+        ec = errors.resolve_transform_error(exit_code, stderr)
+        if ec != 0:
+            job.piloterrorcodes, job.piloterrordiags = errors.add_error_code(ec)
+        else:
+            log.warning('initial error analysis did not resolve the issue')
     else:
-        with open(path) as data_file:
-            # compulsory field; the payload must produce a job report (see config file for file name)
-            job.metadata = json.load(data_file)
-
-            # extract user specific info from job report
-            pilot_user = os.environ.get('PILOT_USER', 'generic').lower()
-            user = __import__('pilot.user.%s.common' % pilot_user, globals(), locals(), [pilot_user], -1)
-            user.update_job_data(job)
-
-            # compulsory fields
-            try:
-                job.exitcode = job.metadata['exitCode']
-            except Exception as e:
-                log.warning('could not find compulsory payload exitCode in job report: %s (will be set to 0)' % e)
-                job.exitcode = 0
-            else:
-                log.info('extracted exit code from job report: %d' % job.exitcode)
-            try:
-                job.exitmsg = job.metadata['exitMsg']
-            except Exception as e:
-                log.warning('could not find compulsory payload exitMsg in job report: %s (will be set to empty string)' % e)
-                job.exitmsg = ""
-            else:
-                log.info('extracted exit message from job report: %s' % job.exitmsg)
+        log.info('main payload execution returned zero exit code, but will check it more carefully')
 
 
 def validate_post(queues, traces, args):
@@ -291,12 +294,12 @@ def validate_post(queues, traces, args):
 
         # by default, both output and log should be staged out
         job.stageout = 'all'
-
-        # process the job report if it exists and set multiple fields
-        process_job_report(job)
-
         log.debug('adding job to data_out queue')
-        queues.data_out.put(job)
+        #queues.data_out.put(job)
+        set_pilot_state(job=job, state='stageout')
+        put_in_queue(job, queues.data_out)
+
+    logger.info('validate_post has finished')
 
 
 def failed_post(queues, traces, args):
@@ -320,4 +323,6 @@ def failed_post(queues, traces, args):
         log.debug('adding log for log stageout')
 
         job.stageout = 'log'  # only stage-out log file
-        queues.data_out.put(job)
+        #queues.data_out.put(job)
+        set_pilot_state(job=job, state='stageout')
+        put_in_queue(job, queues.data_out)

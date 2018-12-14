@@ -8,6 +8,7 @@
 # - Paul Nilsson, paul.nilsson@cern.ch, 2017-2018
 
 import os
+import pipes
 import re
 # for user container test: import urllib
 
@@ -16,6 +17,7 @@ from pilot.user.atlas.setup import get_file_system_root_path
 from pilot.info import infosys
 from pilot.util.auxiliary import get_logger
 from pilot.util.config import config
+from pilot.util.filehandling import write_file
 # import pilot.info.infoservice as infosys
 
 import logging
@@ -27,16 +29,23 @@ def do_use_container(**kwargs):
     Decide whether to use a container or not.
 
     :param kwargs: dictionary of key-word arguments.
-    :return: True is function has decided that a container should be used, False otherwise (boolean).
+    :return: True if function has decided that a container should be used, False otherwise (boolean).
     """
 
-    use_container = True
+    use_container = False
+
+    # to force no container use: return False
 
     job = kwargs.get('job')
     if job:
         # for user jobs, TRF option --containerImage must have been used, ie imagename must be set
-        if not (job.is_analysis() and job.imagename):
+        if job.is_analysis() and job.imagename:
             use_container = False
+        else:
+            queuedata = job.infosys.queuedata
+            container_name = queuedata.container_type.get("pilot")
+            if container_name == 'singularity':
+                use_container = True
 
     return use_container
 
@@ -208,7 +217,17 @@ def alrb_wrapper(cmd, workdir, job):
         #    singularity_options += ' --containall'
         if singularity_options != "":
             _cmd += 'export ALRB_CONT_CMDOPTS=\"%s\";' % singularity_options
-        _cmd += 'export ALRB_CONT_RUNPAYLOAD=\"%s\";' % cmd
+        else:
+            _cmd += 'export ALRB_CONT_CMDOPTS=\"$ALRB_CONT_CMDOPTS -C\";'
+
+        script_file = 'container_script.sh'
+        status = write_file(os.path.join(job.workdir, script_file), cmd, mute=False)
+        if status:
+            script_cmd = '. /srv/' + script_file
+            _cmd += "export ALRB_CONT_RUNPAYLOAD=\'%s\';" % script_cmd
+        else:
+            log.warning('attempting to quote command instead')
+            _cmd += 'export ALRB_CONT_RUNPAYLOAD=%s;' % pipes.quote(cmd)
 
         # this should not be necessary after the extract_container_image() in JobData update
         # containerImage should have been removed already
@@ -226,6 +245,7 @@ def alrb_wrapper(cmd, workdir, job):
 
         _cmd = _cmd.replace('  ', ' ')
         cmd = _cmd
+
         log.info("Updated command: %s" % cmd)
 
     return cmd
@@ -274,23 +294,22 @@ def singularity_wrapper(cmd, workdir, job):
         log.info("singularity has been requested")
 
         # Get the singularity options
-        singularity_options = queuedata.container_options + ",/cvmfs,${workdir},/home"
-        log.debug("resolved singularity_options from queuedata.container_options: %s" % singularity_options)
-
-        if not singularity_options:
-            log.warning('singularity options not set')
+        singularity_options = queuedata.container_options
+        if singularity_options != "":
+            singularity_options += ","
+        else:
+            singularity_options = "-B "
+        singularity_options += "/cvmfs,${workdir},/home"
+        log.debug("using singularity_options: %s" % singularity_options)
 
         # Get the image path
-        if job.imagename:
-            image_path = job.imagename
-        else:
-            image_path = get_grid_image_for_singularity(job.platform)
+        image_path = job.imagename or get_grid_image_for_singularity(job.platform)
 
         # Does the image exist?
-        if image_path != '':
+        if image_path:
             # Prepend it to the given command
-            cmd = "export workdir=" + workdir + "; singularity exec " + singularity_options + " " + image_path + \
-                  " /bin/bash -c \'cd $workdir;pwd;" + cmd.replace("\'", "\\'").replace('\"', '\\"') + "\'"
+            cmd = "export workdir=" + workdir + "; singularity --verbose exec " + singularity_options + " " + image_path + \
+                  " /bin/bash -c " + pipes.quote("cd $workdir;pwd;%s" % cmd)
 
             # for testing user containers
             # singularity_options = "-B $PWD:/data --pwd / "
@@ -299,6 +318,6 @@ def singularity_wrapper(cmd, workdir, job):
         else:
             log.warning("singularity options found but image does not exist")
 
-        log.info("Updated command: %s" % cmd)
+        log.info("updated command: %s" % cmd)
 
     return cmd
