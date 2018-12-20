@@ -105,7 +105,7 @@ def get_initial_work_report():
     work_report = {'jobStatus': 'starting',
                    'messageLevel': logging.getLevelName(logger.getEffectiveLevel()),
                    'cpuConversionFactor': 1.0,
-                   'cpuConsumptionTime': '',
+                   'cpuConsumptionTime': 0,
                    'node': gethostname(),
                    'workdir': '',
                    'timestamp': time_stamp(),

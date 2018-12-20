@@ -18,6 +18,7 @@ from collections import namedtuple
 from datetime import datetime
 
 from pilot.common.exception import FileHandlingFailure
+from pilot.common.errorcodes import ErrorCodes
 from pilot.util.auxiliary import set_pilot_state
 from pilot.util.config import config
 from pilot.util.constants import SUCCESS, FAILURE, PILOT_PRE_GETJOB, PILOT_POST_GETJOB, PILOT_PRE_SETUP, \
@@ -58,11 +59,18 @@ def run(args):
     try:
         logger.info('setting up signal handling')
         signal.signal(signal.SIGINT, functools.partial(interrupt, args))
+        signal.signal(signal.SIGTERM, functools.partial(interrupt, args))
+        signal.signal(signal.SIGQUIT, functools.partial(interrupt, args))
+        signal.signal(signal.SIGSEGV, functools.partial(interrupt, args))
+        signal.signal(signal.SIGXCPU, functools.partial(interrupt, args))
+        signal.signal(signal.SIGUSR1, functools.partial(interrupt, args))
+        signal.signal(signal.SIGBUS, functools.partial(interrupt, args))
 
         logger.info('setting up tracing')
         traces = namedtuple('traces', ['pilot'])
         traces.pilot = {'state': SUCCESS,
-                        'nr_jobs': 0}
+                        'nr_jobs': 0,
+                        'error_code': 0}
 
         if args.hpc_resource == '':
             logger.critical('hpc resource not specified, cannot continue')
@@ -84,6 +92,7 @@ def run(args):
 
         add_to_pilot_timing(job.jobid, PILOT_PRE_SETUP, time.time(), args)
         work_dir = resource.set_job_workdir(job, communication_point)
+        job.workdir = work_dir
         work_report['workdir'] = work_dir
         worker_attributes_file = os.path.join(work_dir, worker_attributes_file)
         logger.debug("Worker attributes will be publeshied in: {0}".format(worker_attributes_file))
@@ -173,8 +182,10 @@ def run(args):
 
         protectedfiles.extend([worker_attributes_file, worker_stageout_declaration])
         user.remove_redundant_files(job_scratch_dir, protectedfiles)
-        res = tar_files(job_scratch_dir, protectedfiles, job.log_file)
+        log_file = job.logdata[0]
+        res = tar_files(job_scratch_dir, protectedfiles, log_file.lfn)
         if res > 0:
+            traces.pilot['error_code'] = ErrorCodes.LOGFILECREATIONFAILURE
             raise FileHandlingFailure("Log file tar failed")
 
         add_to_pilot_timing(job.jobid, PILOT_PRE_STAGEOUT, time.time(), args)
@@ -199,16 +210,17 @@ def run(args):
         publish_work_report(work_report, worker_attributes_file)
         logging.exception('exception caught:')
         traces.pilot['state'] = FAILURE
-
+        traces.pilot['error_code'] = e.code
+    logging.debug("Traces: {0}".format(traces))
     return traces
 
 
 def copy_output(job, job_scratch_dir, work_dir):
     cp_start = time.time()
     try:
-        for outfile in job.output_files.keys():
-            if os.path.exists(outfile):
-                copy(os.path.join(job_scratch_dir, outfile), os.path.join(work_dir, outfile))
+        for outfile in job.outdata + job.logdata:
+            if os.path.exists(outfile.lfn):
+                copy(os.path.join(job_scratch_dir, outfile.lfn), os.path.join(work_dir, outfile.lfn))
         os.chdir(work_dir)
     except IOError:
         raise FileHandlingFailure("Copy from scratch dir to access point failed")
@@ -221,26 +233,25 @@ def copy_output(job, job_scratch_dir, work_dir):
 def declare_output(job, work_report, worker_stageout_declaration):
     out_file_report = {}
     out_file_report[job.jobid] = []
-    for outfile in job.output_files.keys():
-        logger.debug("File {} will be checked and declared for stage out".format(outfile))
-        if os.path.exists(outfile):
-            file_desc = {}
-            if outfile == job.log_file:
-                file_desc['type'] = 'log'
-            else:
-                file_desc['type'] = 'output'
-            file_desc['path'] = os.path.abspath(outfile)
-            file_desc['fsize'] = os.path.getsize(outfile)
-            if 'guid' in job.output_files[outfile].keys():
-                file_desc['guid'] = job.output_files[outfile]['guid']
-            elif work_report['outputfiles'] and work_report['outputfiles'][outfile]:
-                file_desc['guid'] = work_report['outputfiles'][outfile]['guid']
+    for outfile in job.outdata + job.logdata:
+        logger.debug("File [{0}] will be checked and declared for stage out".format(outfile.lfn))
+        file_desc = {}
+        if os.path.exists(os.path.join(job.workdir, outfile.lfn)):
+            file_desc['type'] = outfile.filetype
+            file_desc['path'] = os.path.abspath(outfile.lfn)
+            file_desc['fsize'] = os.path.getsize(outfile.lfn)
+            if outfile.guid:
+                file_desc['guid'] = outfile.guid
+            elif work_report['outputfiles'] and work_report['outputfiles'][outfile.lfn]:
+                file_desc['guid'] = work_report['outputfiles'][outfile.lfn]['guid']
+                outfile.guid = work_report['outputfiles'][outfile.lfn]['guid']
+
             out_file_report[job.jobid].append(file_desc)
         else:
-            logger.info("Expected output file {0} missed. Job {1} will be failed".format(outfile, job.jobid))
+            logger.info("Expected output file {0} missed. Job {1} will be failed".format(outfile.lfn, job.jobid))
             set_pilot_state(job=job, state='failed')
 
     if out_file_report[job.jobid]:
         write_json(worker_stageout_declaration, out_file_report)
         logger.debug('Stagout declared in: {0}'.format(worker_stageout_declaration))
-        logger.debug('Report for stageout: {}'.format(out_file_report))
+        logger.debug('Report for stageout: {0}'.format(out_file_report))
