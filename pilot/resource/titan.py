@@ -9,10 +9,11 @@
 # - Danila Oleynik danila.oleynik@cern.ch, 2018
 
 import logging
-import os
+import os, stat
 import shutil
 import sys
 import time
+import pipes
 
 #from jobdescription import JobDescription
 from pilot.info.jobdata import JobData
@@ -234,8 +235,6 @@ def command_fix(command, job_scratch_dir=""):
     subs_a = command.split()
     for i in range(len(subs_a)):
         if i > 0:
-            if '(' in subs_a[i] and not subs_a[i][0] == '"':
-                subs_a[i] = '"' + subs_a[i] + '"'
             if subs_a[i].startswith("--inputEVNTFile"):
                 filename = subs_a[i].split("=")[1]
                 subs_a[i] = subs_a[i].replace(filename, os.path.join(job_scratch_dir, filename))
@@ -274,3 +273,71 @@ def cleanup_pathes(pathprefix="/lustre/"):
     os.putenv('LD_LIBRARY_PATH', ':'.join(ldpath))
 
     return 0
+
+
+def get_container_wrap(job, img_path, job_scratch_dir = ""):
+    """
+    Prepare the command wrapped in singularity container
+    :param job:
+    :return:
+    """
+    script_file = os.path.join(job_scratch_dir, 'run_payload.sh')
+    setup_cmd = ['#!/bin/bash',
+                 'pwd',
+                 'export SW_INSTALL_AREA=/atlas_releases/AtlasOffline_21.0.15_x86_64-slc6-gcc49-opt',
+                 'source $SW_INSTALL_AREA/AtlasSetup/scripts/asetup.sh 21.0.15 --releasesarea=$SW_INSTALL_AREA --cmakearea=$SW_INSTALL_AREA/sw/lcg/contrib/CMake --gcclocation=$SW_INSTALL_AREA/sw/lcg/releases/gcc/4.9.3/x86_64-slc6',
+                 'export CORAL_DBLOOKUP_PATH=$SW_INSTALL_AREA/DBRelease/current/XMLConfig',
+                 'export CORAL_AUTH_PATH=$SW_INSTALL_AREA/DBRelease/current/XMLConfig',
+                 'export DATAPATH=$SW_INSTALL_AREA/DBRelease/current:$DATAPATH',
+                 'export ATHENA_PROC_NUMBER=16',
+                 'export G4ATLAS_SKIPFILEPEEK=1']
+
+    #setup_str = ";".join(setup_cmd)
+
+    cmd = " ".join([job.transformation, command_fix(job.jobparams, job_scratch_dir)])
+    #cmd = setup_str + ";" + cmd
+    container_run = "singularity --verbose exec {0} /bin/bash -c ".format(img_path)
+
+    script_body = "\n".join(setup_cmd)
+    script_body = script_body + "\n" + cmd
+    logger.debug("Script:\n{0}".format(script_body))
+
+    with open(script_file, 'w') as sf:
+        sf.write(script_body)
+    #cmd = container_run + pipes.quote(cmd)
+    os.chmod(script_file, 0o777)
+    cmd = container_run + script_file
+
+    return cmd
+
+
+def get_payload_command(job, job_scratch_dir=""):
+    """
+    Return command string to launch
+
+    :param job:
+    :return command_str:
+    """
+    command_str = ""
+    img_path = is_container()
+    if img_path:
+        command_str = get_container_wrap(job, img_path, job_scratch_dir)
+    else:
+        setup_str = "; ".join(get_setup())
+        command_str = " ".join([job.transformation, job.jobparams])
+        command_str = command_fix(command_str, job_scratch_dir)
+        command_str = setup_str + command_str
+
+    logger.debug("Payload command:\n{0}\n".format(command_str))
+    return command_str
+
+
+def is_container():
+
+    container_path = ""
+    try:
+        container_path = config.HPC.container
+    except:
+        pass
+
+    return container_path

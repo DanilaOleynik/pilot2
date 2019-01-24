@@ -58,3 +58,35 @@ Before making a pull request, make sure that you are synced to the latest versio
 5. git remote add upstream https://github.com/PanDAWMS/pilot2.git
 6. git fetch upstream
 7. git merge upstream/next
+
+# HPC workflow in Pilot2 
+
+HPC workflow is a special mode of Pilot2 when the application works without a remote connection to PanDA server or other 
+remote facilities. All intercommunication in this case managed by Harvester application. Also, in this mode Pilot2 acts 
+like simple MPI application, which performs execution of multiple jobs on computing nodes of HPC. 
+
+### How to launch HPC workflow
+
+To launch HPC workflow in Pilot2 commandline parameter '-w generic_hpc' should be specified. 
+
+### HPC PlugIns
+
+Different HPC may require special treatments for preparation of launching of payload. To cover this, implementations were 
+placed into HPC specific plugin.
+The particular plugin should be specified through the command line parameter: '--hpc-resource'
+
+### Mandatory functions in HPC Plugin
+
+get_job(communication_point) - retrieve job description and fill Job object (usually from json file)
+
+set_job_workdir(job, communication_point) - set job/pilot working directory
+
+get_setup() return list of setup commands, which may be required by infrastructure
+
+set_scratch_workdir() - setup working directory on transient high-speed storage (RAM disk, local SSD etc)
+
+command_fix() - adapt some payload parameters for execution on particular infrastructure
+
+process_jobreport() - shrink job report file and copy to working directory from scratch if needed
+
+postprocess_workdir() - some post processing of working directory (if needed)

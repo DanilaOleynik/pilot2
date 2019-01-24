@@ -704,7 +704,7 @@ def parse_jobreport_data(job_report):
     dq.get("resource/machine/model_name", work_attributes, "cpuConsumptionUnit")
     dq.get("resource/dbTimeTotal", work_attributes, "dbTime")
     dq.get("resource/dbDataTotal", work_attributes, "dbData")
-    dq.get("exitCode", work_attributes, "transExitCode")
+    dq.get("exitCode", work_attributes, "exeExitCode")
     dq.get("exitMsg", work_attributes, "exeErrorDiag")
     dq.get("files/input", work_attributes, "inputfiles")
     dq.get("files/output", work_attributes, "outputfiles")

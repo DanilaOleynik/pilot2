@@ -112,6 +112,7 @@ def get_initial_work_report():
                    'endTime': '',
                    'transExitCode': 0,
                    'pilotErrorCode': 0,  # only add this in case of failure?
+                   'exeErrorCode': 0
                    }
 
     return work_report

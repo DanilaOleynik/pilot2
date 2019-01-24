@@ -27,6 +27,7 @@ from pilot.util.container import execute
 from pilot.util.filehandling import tar_files, write_json, read_json, copy
 from pilot.util.harvester import get_initial_work_report, publish_work_report
 from pilot.util.timing import add_to_pilot_timing
+from pilot.common.exception import PilotException
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,7 @@ def run(args):
         # get job (and rank)
         add_to_pilot_timing('0', PILOT_PRE_GETJOB, time.time(), args)
         job, rank = resource.get_job(communication_point)
+        job.infosys = args.info.infoservice
         add_to_pilot_timing(job.jobid, PILOT_POST_GETJOB, time.time(), args)
         # cd to job working directory
 
@@ -108,9 +110,12 @@ def run(args):
         # Prepare job scratch directory (RAM disk etc.)
         job_scratch_dir = resource.set_scratch_workdir(job, work_dir, args)
 
-        my_command = " ".join([job.transformation, job.jobparams])
-        my_command = resource.command_fix(my_command, job_scratch_dir)
-        my_command = setup_str + my_command
+        #my_command = " ".join([job.transformation, job.jobparams])
+        #my_command = resource.command_fix(my_command, job_scratch_dir)
+        #my_command = setup_str + my_command
+
+        my_command = resource.get_payload_command(job, job_scratch_dir)
+
         add_to_pilot_timing(job.jobid, PILOT_POST_SETUP, time.time(), args)
 
         # Basic execution. Should be replaced with something like 'run_payload'
@@ -143,8 +148,7 @@ def run(args):
 
         state = 'finished' if exit_code == 0 else 'failed'
         set_pilot_state(job=job, state=state)
-        job.transexitcode = exit_code
-
+        job.transexitcode = exit_code % 255
         work_report["startTime"] = job.startTime
         work_report["endTime"] = job.endTime
         work_report["jobStatus"] = job.state
@@ -164,8 +168,10 @@ def run(args):
         if os.path.exists(payload_report_file):
             payload_report = user.parse_jobreport_data(read_json(payload_report_file))
             work_report.update(payload_report)
-            resource.process_jobreport(payload_report_file, job_scratch_dir, work_dir)
+            if 'exeExitCode' in payload_report.keys():
+                job.exeerrorcode = payload_report['exeExitCode']
 
+        logger.info("Exit code (job report): {0}".format(job.exeerrorcode))
         resource.postprocess_workdir(job_scratch_dir)
 
         # output files should not be packed with logs
@@ -204,13 +210,14 @@ def run(args):
         logger.debug("Final report: {0}".format(work_report))
         add_to_pilot_timing(job.jobid, PILOT_POST_FINAL_UPDATE, time.time(), args)
 
-    except Exception as e:
+    except PilotException as e:
         work_report["jobStatus"] = "failed"
         work_report["exitMsg"] = str(e)
+        work_report["pilotErrorCode"] = e.get_error_code()
         publish_work_report(work_report, worker_attributes_file)
-        logging.exception('exception caught:')
+        logging.exception('Exception message: {0}'.format(work_report["exitMsg"]))
         traces.pilot['state'] = FAILURE
-        traces.pilot['error_code'] = e.code
+        traces.pilot['error_code'] = e.get_error_code()
     logging.debug("Traces: {0}".format(traces))
     return traces
 
@@ -242,7 +249,7 @@ def declare_output(job, work_report, worker_stageout_declaration):
             file_desc['fsize'] = os.path.getsize(outfile.lfn)
             if outfile.guid:
                 file_desc['guid'] = outfile.guid
-            elif work_report['outputfiles'] and work_report['outputfiles'][outfile.lfn]:
+            elif 'outputfiles' in (work_report.keys()) and outfile.lfn in (work_report['outputfiles'].keys()):
                 file_desc['guid'] = work_report['outputfiles'][outfile.lfn]['guid']
                 outfile.guid = work_report['outputfiles'][outfile.lfn]['guid']
 
